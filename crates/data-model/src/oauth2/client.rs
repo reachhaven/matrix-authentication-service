@@ -93,6 +93,11 @@ pub struct Client {
     /// Whether this client is statically configured (defined in the
     /// configuration file) rather than dynamically registered.
     pub is_static: bool,
+
+    /// Whether to skip the consent screen for this client, unless the client
+    /// asks for it with `prompt=consent`. Only statically configured clients
+    /// can have this set.
+    pub skip_consent: bool,
 }
 
 #[derive(Debug, Error)]
@@ -209,6 +214,7 @@ impl Client {
                 userinfo_signed_response_alg: None,
                 jwks: None,
                 is_static: false,
+                skip_consent: false,
             },
             // Another client without any URIs set
             Self {
@@ -231,6 +237,7 @@ impl Client {
                 userinfo_signed_response_alg: None,
                 jwks: None,
                 is_static: false,
+                skip_consent: false,
             },
         ]
     }

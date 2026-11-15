@@ -80,6 +80,7 @@ struct OAuth2ClientLookup {
     token_endpoint_auth_signing_alg: Option<String>,
     initiate_login_uri: Option<String>,
     is_static: bool,
+    skip_consent: bool,
 }
 
 impl Node<Ulid> for OAuth2ClientLookup {
@@ -314,6 +315,7 @@ impl TryFrom<OAuth2ClientLookup> for Client {
             token_endpoint_auth_signing_alg,
             initiate_login_uri,
             is_static: value.is_static,
+            skip_consent: value.skip_consent,
         })
     }
 }
@@ -356,6 +358,7 @@ impl OAuth2ClientRepository for PgOAuth2ClientRepository<'_> {
                      , token_endpoint_auth_signing_alg
                      , initiate_login_uri
                      , is_static
+                     , skip_consent
                 FROM oauth2_clients c
 
                 WHERE oauth2_client_id = $1
@@ -408,6 +411,7 @@ impl OAuth2ClientRepository for PgOAuth2ClientRepository<'_> {
                      , token_endpoint_auth_signing_alg
                      , initiate_login_uri
                      , is_static
+                     , skip_consent
                 FROM oauth2_clients c
 
                 WHERE oauth2_client_id = ANY($1::uuid[])
@@ -530,6 +534,7 @@ impl OAuth2ClientRepository for PgOAuth2ClientRepository<'_> {
                         , token_endpoint_auth_signing_alg
                         , initiate_login_uri
                         , is_static
+                        , skip_consent
             "#,
             Uuid::from(id),
             metadata_digest,
@@ -588,6 +593,7 @@ impl OAuth2ClientRepository for PgOAuth2ClientRepository<'_> {
         jwks: Option<PublicJsonWebKeySet>,
         jwks_uri: Option<Url>,
         redirect_uris: Vec<Url>,
+        skip_consent: bool,
     ) -> Result<Client, Self::Error> {
         let jwks_json = jwks
             .as_ref()
@@ -614,9 +620,10 @@ impl OAuth2ClientRepository for PgOAuth2ClientRepository<'_> {
                     , client_uri
                     , jwks_uri
                     , is_static
+                    , skip_consent
                     )
                 VALUES
-                    ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, TRUE)
+                    ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, TRUE, $13)
                 ON CONFLICT (oauth2_client_id)
                 DO
                     UPDATE SET encrypted_client_secret = EXCLUDED.encrypted_client_secret
@@ -631,6 +638,7 @@ impl OAuth2ClientRepository for PgOAuth2ClientRepository<'_> {
                              , client_uri = EXCLUDED.client_uri
                              , jwks_uri = EXCLUDED.jwks_uri
                              , is_static = TRUE
+                             , skip_consent = EXCLUDED.skip_consent
             "#,
             Uuid::from(client_id),
             encrypted_client_secret,
@@ -644,6 +652,7 @@ impl OAuth2ClientRepository for PgOAuth2ClientRepository<'_> {
             client_name,
             client_uri.as_ref().map(Url::as_str),
             jwks_uri.as_ref().map(Url::as_str),
+            skip_consent,
         )
         .traced()
         .execute(&mut *self.conn)
@@ -680,6 +689,7 @@ impl OAuth2ClientRepository for PgOAuth2ClientRepository<'_> {
             token_endpoint_auth_signing_alg: None,
             initiate_login_uri: None,
             is_static: true,
+            skip_consent,
         })
     }
 
@@ -716,6 +726,7 @@ impl OAuth2ClientRepository for PgOAuth2ClientRepository<'_> {
                      , token_endpoint_auth_signing_alg
                      , initiate_login_uri
                      , is_static
+                     , skip_consent
                 FROM oauth2_clients c
                 WHERE is_static = TRUE
             "#,
@@ -970,6 +981,10 @@ impl OAuth2ClientRepository for PgOAuth2ClientRepository<'_> {
             .expr_as(
                 Expr::col((OAuth2Clients::Table, OAuth2Clients::IsStatic)),
                 OAuth2ClientLookupIden::IsStatic,
+            )
+            .expr_as(
+                Expr::cust("skip_consent"),
+                OAuth2ClientLookupIden::SkipConsent,
             )
             .from(OAuth2Clients::Table)
             .apply_filter(filter)

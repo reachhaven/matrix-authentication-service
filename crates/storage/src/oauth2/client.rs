@@ -253,6 +253,7 @@ pub trait OAuth2ClientRepository: Send + Sync {
     /// * `jwks`: The client JWKS, if any
     /// * `jwks_uri`: The client JWKS URI, if any
     /// * `redirect_uris`: The list of redirect URIs used by this client
+    /// * `skip_consent`: Whether to skip the consent screen for this client
     ///
     /// # Errors
     ///
@@ -268,6 +269,7 @@ pub trait OAuth2ClientRepository: Send + Sync {
         jwks: Option<PublicJsonWebKeySet>,
         jwks_uri: Option<Url>,
         redirect_uris: Vec<Url>,
+        skip_consent: bool,
     ) -> Result<Client, Self::Error>;
 
     /// List all static clients
@@ -372,6 +374,7 @@ repository_impl!(OAuth2ClientRepository:
         jwks: Option<PublicJsonWebKeySet>,
         jwks_uri: Option<Url>,
         redirect_uris: Vec<Url>,
+        skip_consent: bool,
     ) -> Result<Client, Self::Error>;
 
     async fn all_static(&mut self) -> Result<Vec<Client>, Self::Error>;

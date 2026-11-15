@@ -18,7 +18,11 @@ use mas_axum_utils::{
     cookies::CookieJar,
     csrf::{CsrfExt, ProtectedForm},
 };
-use mas_data_model::{AuthorizationGrantStage, BoxClock, BoxRng, MatrixUser};
+use mas_data_model::{
+    AuthorizationGrant, AuthorizationGrantStage, BoxClock, BoxRng, BrowserSession, Client,
+    MatrixUser,
+};
+use mas_i18n::DataLocale;
 use mas_keystore::Keystore;
 use mas_matrix::HomeserverConnection;
 use mas_policy::Policy;
@@ -28,7 +32,7 @@ use mas_storage::{
     oauth2::{OAuth2AuthorizationGrantRepository, OAuth2ClientRepository},
 };
 use mas_templates::{ConsentContext, PolicyViolationContext, TemplateContext, Templates};
-use oauth2_types::requests::AuthorizationResponse;
+use oauth2_types::requests::{AuthorizationResponse, Prompt};
 use thiserror::Error;
 use ulid::Ulid;
 
@@ -80,6 +84,71 @@ impl IntoResponse for RouteError {
     }
 }
 
+/// Whether the client asked for the consent screen with `prompt=consent`, as
+/// defined in [OpenID Connect Core 1.0](https://openid.net/specs/openid-connect-core-1_0.html#AuthRequest)
+fn prompts_for_consent(grant: &AuthorizationGrant) -> bool {
+    grant.raw_parameters.get("prompt").is_some_and(|prompt| {
+        prompt
+            .split(' ')
+            .any(|value| matches!(value.parse(), Ok(Prompt::Consent)))
+    })
+}
+
+/// Fulfill the grant with the browser session, and send the user back to the
+/// client
+async fn fulfill_grant_and_redirect(
+    rng: &mut BoxRng,
+    clock: &BoxClock,
+    mut repo: BoxRepository,
+    key_store: &Keystore,
+    url_builder: &UrlBuilder,
+    templates: &Templates,
+    locale: &DataLocale,
+    client: &Client,
+    browser_session: &BrowserSession,
+    grant: AuthorizationGrant,
+) -> Result<Response, RouteError> {
+    let callback_destination = CallbackDestination::try_from(&grant)?;
+
+    // The OAuth2 session will be created later at token exchange time.
+    let grant = repo
+        .oauth2_authorization_grant()
+        .fulfill(clock, browser_session, grant)
+        .await?;
+
+    let mut params = AuthorizationResponse::default();
+
+    // Did they request an ID token?
+    if grant.response_type_id_token {
+        // Fetch the last authentication
+        let last_authentication = repo
+            .browser_session()
+            .get_last_authentication(browser_session)
+            .await?;
+
+        params.id_token = Some(generate_id_token(
+            rng,
+            clock,
+            url_builder,
+            key_store,
+            client,
+            Some(&grant),
+            browser_session,
+            None,
+            last_authentication.as_ref(),
+        )?);
+    }
+
+    // Did they request an auth code?
+    if let Some(code) = grant.code {
+        params.code = Some(code.code);
+    }
+
+    repo.save().await?;
+
+    Ok(callback_destination.go(templates, locale, params)?)
+}
+
 #[tracing::instrument(
     name = "handlers.oauth2.authorization.consent.get",
     fields(grant.id = %grant_id),
@@ -91,6 +160,7 @@ pub(crate) async fn get(
     PreferredLanguage(locale): PreferredLanguage,
     State(templates): State<Templates>,
     State(url_builder): State<UrlBuilder>,
+    State(key_store): State<Keystore>,
     State(homeserver): State<Arc<dyn HomeserverConnection>>,
     mut policy: Policy,
     mut repo: BoxRepository,
@@ -149,9 +219,6 @@ pub(crate) async fn get(
 
     let session_counts = count_user_sessions_for_limiting(&mut repo, &session.user).await?;
 
-    // We can close the repository early, we don't need it at this point
-    repo.save().await?;
-
     let res = policy
         .evaluate_authorization_grant(mas_policy::AuthorizationGrantInput {
             user: Some(&session.user),
@@ -165,6 +232,28 @@ pub(crate) async fn get(
             },
         })
         .await?;
+
+    if res.valid() && client.skip_consent && !prompts_for_consent(&grant) {
+        let response = fulfill_grant_and_redirect(
+            &mut rng,
+            &clock,
+            repo,
+            &key_store,
+            &url_builder,
+            &templates,
+            &locale,
+            &client,
+            &session,
+            grant,
+        )
+        .await?;
+
+        return Ok((cookie_jar, response).into_response());
+    }
+
+    // We can close the repository early, we don't need it at this point
+    repo.save().await?;
+
     if !res.valid() {
         let ctx = PolicyViolationContext::for_authorization_grant(grant, client, res.violations)
             .with_session(session)
@@ -266,7 +355,6 @@ pub(crate) async fn post(
         .lookup(grant_id)
         .await?
         .ok_or(RouteError::GrantNotFound)?;
-    let callback_destination = CallbackDestination::try_from(&grant)?;
 
     let Some(browser_session) = maybe_session else {
         let next = PostAuthAction::continue_grant(grant_id);
@@ -316,45 +404,177 @@ pub(crate) async fn post(
     }
 
     // All good, let's fulfill the grant with the browser session.
-    // The OAuth2 session will be created later at token exchange time.
-    let grant = repo
-        .oauth2_authorization_grant()
-        .fulfill(&clock, &browser_session, grant)
-        .await?;
-
-    let mut params = AuthorizationResponse::default();
-
-    // Did they request an ID token?
-    if grant.response_type_id_token {
-        // Fetch the last authentication
-        let last_authentication = repo
-            .browser_session()
-            .get_last_authentication(&browser_session)
-            .await?;
-
-        params.id_token = Some(generate_id_token(
-            &mut rng,
-            &clock,
-            &url_builder,
-            &key_store,
-            &client,
-            Some(&grant),
-            &browser_session,
-            None,
-            last_authentication.as_ref(),
-        )?);
-    }
-
-    // Did they request an auth code?
-    if let Some(code) = grant.code {
-        params.code = Some(code.code);
-    }
-
-    repo.save().await?;
-
-    Ok((
-        cookie_jar,
-        callback_destination.go(&templates, &locale, params)?,
+    let response = fulfill_grant_and_redirect(
+        &mut rng,
+        &clock,
+        repo,
+        &key_store,
+        &url_builder,
+        &templates,
+        &locale,
+        &client,
+        &browser_session,
+        grant,
     )
-        .into_response())
+    .await?;
+
+    Ok((cookie_jar, response).into_response())
+}
+
+#[cfg(test)]
+mod tests {
+    use hyper::{
+        Request, Response, StatusCode,
+        header::{CONTENT_TYPE, LOCATION},
+    };
+    use mas_axum_utils::SessionInfoExt;
+    use mas_data_model::{AuthorizationGrant, AuthorizationGrantStage, Clock, UlidExt as _};
+    use mas_iana::oauth::OAuthClientAuthenticationMethod;
+    use mas_storage::RepositoryAccess;
+    use sqlx::PgPool;
+    use ulid::Ulid;
+
+    use crate::test_utils::{CookieHelper, RequestBuilderExt, ResponseExt, TestState, setup};
+
+    /// Sign a user in, configure a static client and send an authorization
+    /// request for it, returning the session cookies and the grant ID
+    async fn start_grant(
+        state: &TestState,
+        skip_consent: bool,
+        prompt: Option<&str>,
+    ) -> (CookieHelper, Ulid) {
+        let mut rng = state.rng();
+        let mut repo = state.repository().await.unwrap();
+
+        let user = repo
+            .user()
+            .add(&mut rng, &state.clock, "alice".to_owned())
+            .await
+            .unwrap();
+        let browser_session = repo
+            .browser_session()
+            .add(&mut rng, &state.clock, &user, None)
+            .await
+            .unwrap();
+
+        let client_id = Ulid::from_datetime_with_rng(state.clock.now(), &mut rng);
+        repo.oauth2_client()
+            .upsert_static(
+                client_id,
+                Some("Static client".to_owned()),
+                None,
+                OAuthClientAuthenticationMethod::None,
+                None,
+                None,
+                None,
+                vec!["https://example.com/callback".parse().unwrap()],
+                skip_consent,
+            )
+            .await
+            .unwrap();
+
+        repo.save().await.unwrap();
+
+        let cookies = CookieHelper::new();
+        cookies.import(state.cookie_jar().set_session(&browser_session));
+
+        let query = {
+            let mut query = url::form_urlencoded::Serializer::new(String::new());
+            query
+                .append_pair("response_type", "code")
+                .append_pair("client_id", &client_id.to_string())
+                .append_pair("redirect_uri", "https://example.com/callback")
+                .append_pair("scope", "openid")
+                .append_pair("state", "test-state-value");
+            if let Some(prompt) = prompt {
+                query.append_pair("prompt", prompt);
+            }
+            query.finish()
+        };
+
+        let request = cookies.with_cookies(Request::get(format!("/authorize?{query}")).empty());
+        let response = state.request(request).await;
+        response.assert_status(StatusCode::SEE_OTHER);
+
+        let grant_id = response.headers()[LOCATION]
+            .to_str()
+            .unwrap()
+            .strip_prefix("/consent/")
+            .expect("the authorization request should continue to the consent screen")
+            .parse()
+            .unwrap();
+
+        (cookies, grant_id)
+    }
+
+    async fn get_consent(
+        state: &TestState,
+        cookies: &CookieHelper,
+        grant_id: Ulid,
+    ) -> Response<String> {
+        let request = cookies.with_cookies(Request::get(format!("/consent/{grant_id}")).empty());
+        state.request(request).await
+    }
+
+    async fn lookup_grant(state: &TestState, grant_id: Ulid) -> AuthorizationGrant {
+        let mut repo = state.repository().await.unwrap();
+        repo.oauth2_authorization_grant()
+            .lookup(grant_id)
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    fn assert_consent_screen(response: &Response<String>) {
+        response.assert_status(StatusCode::OK);
+        response.assert_header_value(CONTENT_TYPE, "text/html; charset=utf-8");
+        assert!(response.body().contains("layout-container consent"));
+    }
+
+    #[sqlx::test(migrator = "mas_storage_pg::MIGRATOR")]
+    async fn test_skip_consent(pool: PgPool) {
+        setup();
+        let state = TestState::from_pool(pool).await.unwrap();
+        let (cookies, grant_id) = start_grant(&state, true, None).await;
+
+        let response = get_consent(&state, &cookies, grant_id).await;
+        response.assert_status(StatusCode::SEE_OTHER);
+
+        let grant = lookup_grant(&state, grant_id).await;
+        assert!(matches!(
+            grant.stage,
+            AuthorizationGrantStage::Fulfilled { .. }
+        ));
+        let code = grant.code.unwrap().code;
+        response.assert_header_value(
+            LOCATION,
+            &format!("https://example.com/callback?state=test-state-value&code={code}#"),
+        );
+    }
+
+    #[sqlx::test(migrator = "mas_storage_pg::MIGRATOR")]
+    async fn test_consent_screen_without_skip_consent(pool: PgPool) {
+        setup();
+        let state = TestState::from_pool(pool).await.unwrap();
+        let (cookies, grant_id) = start_grant(&state, false, None).await;
+
+        let response = get_consent(&state, &cookies, grant_id).await;
+        assert_consent_screen(&response);
+
+        let grant = lookup_grant(&state, grant_id).await;
+        assert!(matches!(grant.stage, AuthorizationGrantStage::Pending));
+    }
+
+    #[sqlx::test(migrator = "mas_storage_pg::MIGRATOR")]
+    async fn test_consent_screen_with_prompt_consent(pool: PgPool) {
+        setup();
+        let state = TestState::from_pool(pool).await.unwrap();
+        let (cookies, grant_id) = start_grant(&state, true, Some("consent")).await;
+
+        let response = get_consent(&state, &cookies, grant_id).await;
+        assert_consent_screen(&response);
+
+        let grant = lookup_grant(&state, grant_id).await;
+        assert!(matches!(grant.stage, AuthorizationGrantStage::Pending));
+    }
 }
