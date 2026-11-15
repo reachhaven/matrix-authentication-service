@@ -96,6 +96,15 @@ pub struct ClientConfig {
     /// List of allowed redirect URIs
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub redirect_uris: Vec<Url>,
+
+    /// Whether to skip the consent screen for this client. Defaults to
+    /// `false`.
+    ///
+    /// This is meant for first-party clients. The consent screen is still
+    /// shown if the client asks for it with `prompt=consent` in its
+    /// authorization request.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub skip_consent: bool,
 }
 
 impl ClientConfig {
@@ -290,6 +299,7 @@ mod tests {
                           client_auth_method: none
                           redirect_uris:
                             - https://exemple.fr/callback
+                          skip_consent: true
 
                         - client_id: 01GFWR32NCQ12B8Z0J8CPXRRB6
                           client_auth_method: client_secret_basic
@@ -346,12 +356,14 @@ mod tests {
                     config.0[0].redirect_uris,
                     vec!["https://exemple.fr/callback".parse().unwrap()]
                 );
+                assert!(config.0[0].skip_consent);
 
                 assert_eq!(
                     config.0[1].client_id,
                     Ulid::from_str("01GFWR32NCQ12B8Z0J8CPXRRB6").unwrap()
                 );
                 assert_eq!(config.0[1].redirect_uris, Vec::new());
+                assert!(!config.0[1].skip_consent);
 
                 assert!(config.0[0].client_secret.is_none());
                 assert!(matches!(config.0[1].client_secret, Some(ClientSecret::File(ref p)) if p == "secret"));

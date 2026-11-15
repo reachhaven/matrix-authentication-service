@@ -1288,6 +1288,7 @@ mod tests {
                 None,
                 None,
                 vec!["https://static.example.com/redirect".parse().unwrap()],
+                true,
             )
             .await
             .unwrap();
@@ -1298,6 +1299,7 @@ mod tests {
             .await
             .unwrap()
             .expect("static client just inserted");
+        assert!(static_client.skip_consent);
 
         assert_eq!(repo.oauth2_client().count(filter).await.unwrap(), 3);
 

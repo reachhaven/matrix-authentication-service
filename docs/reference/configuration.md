@@ -209,6 +209,8 @@ clients:
     client_auth_method: none
 ```
 
+Setting `skip_consent: true` on a client skips the consent screen for it when the policy allows the grant. It defaults to `false` and is meant for first-party clients configured by the operator. The consent screen is still shown if the client asks for it with `prompt=consent` in its authorization request, as defined in [OpenID Connect Core 1.0](https://openid.net/specs/openid-connect-core-1_0.html#AuthRequest).
+
 **Note:** any additions or modifications in this list are synced with the database on server startup. Removed entries are only removed with the [`config sync --prune`](../reference/cli/config.md#config-sync---prune---dry-run) command.
 
 ## `secrets`

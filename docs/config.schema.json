@@ -306,6 +306,10 @@
             "type": "string",
             "format": "uri"
           }
+        },
+        "skip_consent": {
+          "description": "Whether to skip the consent screen for this client. Defaults to\n`false`.\n\nThis is meant for first-party clients. The consent screen is still\nshown if the client asks for it with `prompt=consent` in its\nauthorization request.",
+          "type": "boolean"
         }
       },
       "required": [
